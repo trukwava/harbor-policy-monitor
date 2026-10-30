@@ -1,0 +1,19 @@
+{
+  "name": "harbor-policy-monitor",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Offline-first synthetic policy change review demonstrator",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node --disable-warning=ExperimentalWarning dist/server.js",
+    "test": "npm run build && node --disable-warning=ExperimentalWarning --test dist/tests/*.test.js",
+    "check": "npm run test"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "typescript": "5.8.3"
+  }
+}
