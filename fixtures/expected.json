@@ -1,0 +1,15 @@
+{
+  "note":"Deterministic output of initial complete fixture replay under normalizer-v1 (synthetic data only)",
+  "sources":5,
+  "fixtureEvents":16,
+  "successfulSnapshots":15,
+  "fetchFailures":1,
+  "changeCandidates":9,
+  "candidatesBySource":{"housing":1,"food":2,"youth":2,"provider":2,"access":2},
+  "criticalEvidence":{"sourceId":"housing","linkedDocument":"housing-limit","sourcePath":"/documents/eligibility.pdf","before":"$2,000","after":"$2,500"},
+  "editorialChange":{"sourceId":"youth","changeKind":"editorial"},
+  "deletedAttachment":{"sourceId":"provider","changeKind":"disappeared","interpretation":"absence, not withdrawal"},
+  "lastFailure":{"sourceId":"access","state":"failure","reason":"Simulated upstream timeout"},
+  "mustNotCreateAutomaticActions":true,
+  "changedURLSameHashCreatesNewCandidate":false
+}
