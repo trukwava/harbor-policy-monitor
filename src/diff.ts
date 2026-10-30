@@ -49,8 +49,13 @@ export function diffText(beforeRaw:string,afterRaw:string):DiffHunk[] {
 export function candidateDate(text:string):{value:string|null;note:string} {
   const explicit=text.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(20\d{2})\b/i);
   if(explicit){
-    const ms=Date.parse(`${explicit[1]} ${explicit[2]}, ${explicit[3]}`);
-    if(Number.isFinite(ms))return {value:new Date(ms).toISOString().slice(0,10),note:'Unconfirmed date extracted from source text'};
+    const monthNames=['january','february','march','april','may','june','july','august','september','october','november','december'];
+    const month=monthNames.indexOf(explicit[1].toLowerCase())+1;
+    const day=Number(explicit[2]),year=Number(explicit[3]);
+    const candidate=new Date(Date.UTC(year,month-1,day));
+    if(candidate.getUTCFullYear()===year&&candidate.getUTCMonth()+1===month&&candidate.getUTCDate()===day)
+      return {value:`${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`,note:'Unconfirmed date extracted from source text'};
+    return {value:null,note:'Source contains an invalid calendar date; reviewer must verify rather than normalizing it.'};
   }
   const ambiguous=text.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b/i);
   return {value:null,note:ambiguous?'Source mentions a month/day without an unambiguous year; reviewer must confirm.':'No unambiguous effective date detected.'};
