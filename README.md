@@ -1,6 +1,6 @@
 # Harbor Policy Operations — Policy-Change Monitor and Action Queue
 
-> **Publication status:** The full working source archive has been prepared and tested locally. Repository source upload is still in progress; the installation commands below apply to the complete archive rather than this repository until all files are present.
+> **Publication status:** The full working source archive has been prepared and tested locally. Repository source upload is still in progress. This repository currently contains documentation and selected source/config files, **not the complete runnable application**. To publish the full source, download the latest GitHub-ready ZIP supplied in the ChatGPT conversation and run `bash scripts/publish-to-github.sh` from its extracted project directory (requires GitHub push authentication). The installation commands below apply to that complete archive.
 
 
 **Status:** Working offline P0 demonstration, **not** a production public-source monitoring system. All sources, people and content are synthetic. This application is a fresh implementation; it neither uses Met Council code nor represents Met Council or a real customer.
@@ -20,7 +20,7 @@ npm start
 Open **http://127.0.0.1:4173** in your browser. The app binds to loopback only. The database is created at `data/harbor.sqlite` and persists between server restarts and browser reloads. An already-built `dist/` folder is included in the distributable; rebuilding after edits is recommended.
 
 ```bash
-npm test                     # 17 focused acceptance tests
+npm test                     # 22 focused acceptance tests
 PORT=4180 npm start         # optional non-default local port
 DB_PATH=/tmp/harbor.sqlite npm start  # optional local database location
 ```
@@ -64,7 +64,7 @@ The SQLite entities are `Source`, `SourcePolicyVersion`, `FetchAttempt`, `Snapsh
 | Food bulletin instruction-like text | Stored/displayed as untrusted evidence; never executes an action |
 | Repeated polls | Fetch attempts may be recorded, but review candidate count remains stable |
 
-`npm test` verifies these behaviors , a source-scope exclusion test, and a reviewer workflow that persists across close/reopen of SQLite. Tests use only in-memory or temporary synthetic databases. **17 of 17 focused tests passed in the latest local build.** A headless browser DOM verification also exercised actual front-end forms against the local API using a bridge, because direct HTTP navigation by Chromium was blocked in the execution environment. It verified reviewer classification, action assignment, acknowledgment, resolution, reload/new-page persistence, coverage state and mobile layout; no page JS errors were observed. This is not equivalent to testing a browser's full HTTP deployment path.
+`npm test` verifies these behaviors , a source-scope exclusion test, and a reviewer workflow that persists across close/reopen of SQLite. Tests use only in-memory or temporary synthetic databases. **22 of 22 focused tests passed in the latest local build.** A headless browser DOM verification also exercised actual front-end forms against the local API using a bridge, because direct HTTP navigation by Chromium was blocked in the execution environment. It verified reviewer classification, action assignment, acknowledgment, resolution, reload/new-page persistence, coverage state and mobile layout; no page JS errors were observed. This is not equivalent to testing a browser's full HTTP deployment path.
 
 ## Security and limitations
 
@@ -87,3 +87,10 @@ Data retention: SQLite rows persist until the synthetic reset, manual deletion o
 ### Inspiration and provenance
 
 Harbor Policy Operations is a fictional, original implementation using synthetic records. The project does not incorporate third-party code, branding, customer records, interview findings or performance figures. It should not be interpreted as evidence of customer validation.
+## v0.2 engineering continuation
+
+- Added SHA-256 evidence receipts, local consistency checks, review/audit linkage, and a downloadable JSON endpoint.
+- Added a bounded large-document diff path and strict rejection of invalid calendar dates.
+- Hardened action resolution immutability, duplicate no-op updates, and loopback Host validation.
+- Latest complete local archive: **22/22 automated tests passed** and the evidence/review/action UI was exercised in an isolated browser test.
+- **Publication warning:** this GitHub repository is only partially populated; use the complete source archive and safe publishing script to finish the upload before attempting `npm test` from a GitHub clone.
