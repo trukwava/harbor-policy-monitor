@@ -94,3 +94,10 @@ Harbor Policy Operations is a fictional, original implementation using synthetic
 - Hardened action resolution immutability, duplicate no-op updates, and loopback Host validation.
 - Latest complete local archive: **22/22 automated tests passed** and the evidence/review/action UI was exercised in an isolated browser test.
 - **Publication warning:** this GitHub repository is only partially populated; use the complete source archive and safe publishing script to finish the upload before attempting `npm test` from a GitHub clone.
+
+
+## Network ingestion security preflight (in development)
+
+`src/network-policy.ts` contains a deliberately disconnected validation boundary for a future approved-source adapter. It rejects non-HTTPS URLs, nondefault ports, credentials, unapproved or internal hostnames, redirects outside the exact approved host, and DNS answers containing non-public/special-purpose IP addresses. `src/tests/network-policy.test.ts` covers these security constraints.
+
+**It does not fetch live sources.** A production HTTP adapter must pin the validated DNS answers to actual TLS connections, enforce response byte/time/type limits, use a maintained special-purpose IP range list (including IPv6), re-check every redirect and DNS resolution, honor rate limits, and be reviewed for SSRF bypasses before any internet access is enabled. The offline demo keeps `DEMO_MODE=false` disabled. Do not use preflight alone as a secure network transport.
