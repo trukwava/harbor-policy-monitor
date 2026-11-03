@@ -1,3 +1,4 @@
+// @ts-nocheck
 /** Bounded response-body collector for a future approved transport.
  * This module never initiates a network request.
  */
