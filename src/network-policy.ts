@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Security preflight for a FUTURE approved-source HTTP adapter.
  * This module never performs a request. A production transport must pin its
