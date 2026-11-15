@@ -8,9 +8,15 @@ import net from 'node:net';
 
 export type SourceBoundary = {approvedHost: string; maxRedirects?: number};
 const FORBIDDEN_HOST_SUFFIXES = ['.localhost','.local','.internal','.test','.invalid','.example'];
-const V4_DENY: ReadonlyArray<readonly [number,number]> = [
- [0,8],[10,8],[100,10],[127,8],[169,16],[172,12],[192,24],
- [192,16],[198,15],[203,24],[224,4],[240,4]
+// Explicit networks from the IANA IPv4 Special-Purpose Address Registry.
+// Conservatively deny the entire protocol-assignment /24, including its
+// globally reachable exceptions. This preflight is not a live collector.
+const V4_DENY: ReadonlyArray<readonly [string,number]> = [
+ ['0.0.0.0',8], ['10.0.0.0',8], ['100.64.0.0',10],
+ ['127.0.0.0',8], ['169.254.0.0',16], ['172.16.0.0',12],
+ ['192.0.0.0',24], ['192.0.2.0',24], ['192.88.99.0',24],
+ ['192.168.0.0',16], ['198.18.0.0',15], ['198.51.100.0',24],
+ ['203.0.113.0',24], ['224.0.0.0',4], ['240.0.0.0',4]
 ];
 function inV4Range(value:number, network:number, prefix:number):boolean {
  const mask=prefix===0?0:(0xffffffff << (32-prefix))>>>0;
@@ -24,7 +30,7 @@ function v4ToInt(ip:string):number|null {
 function privateV4(ip:string):boolean {
  const value=v4ToInt(ip);
  if(value===null)return true;
- return V4_DENY.some(([base,prefix])=>inV4Range(value,base,prefix));
+ return V4_DENY.some(([base,prefix])=>inV4Range(value,v4ToInt(base)!,prefix));
 }
 /** Fail closed on non-global unicast addresses, including mapped IPv4. */
 export function publicAddress(address:string):boolean {
