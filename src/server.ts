@@ -2,14 +2,25 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import {openDb,initDemo,resetDemo,replayOne,replayAll,getOverview,candidateDetails,reviewCandidate,createAction,updateAction,updateSource,makeDigest,searchArchive,evidencePacket} from './engine';
+import {openDb,initDemo,resetDemo,replayOne,replayAll,getOverview,candidateDetails,reviewCandidate,createAction,updateAction,updateSource,makeDigest,searchArchive,evidencePacket,approveLiveSource,pollLiveSource} from './engine';
 
 const HOST=process.env.HOST||'127.0.0.1';
 const PORT=Number(process.env.PORT||4173);
 const demo=process.env.DEMO_MODE!=='false';
-if(!demo)throw Error('No live connectors are implemented. DEMO_MODE=false is not supported.');
+if(!demo)throw Error('DEMO_MODE=false is not supported. Approved-source retrieval is the separate opt-in LIVE_FETCH=enabled.');
+// Live retrieval is off unless explicitly enabled; anything but these values refuses to start.
+const liveSetting=process.env.LIVE_FETCH||'disabled';
+if(!['enabled','disabled'].includes(liveSetting))throw Error("LIVE_FETCH must be 'enabled' or 'disabled'");
+const live=liveSetting==='enabled';
 const db=openDb(process.env.DB_PATH||path.resolve(__dirname,'../data/harbor.sqlite'));
-initDemo(db);
+// The administrator's approved-source file is the only source of a live allowlist.
+const approveConfigured=()=>{
+  if(!live||!process.env.LIVE_SOURCES_FILE)return;
+  const policies=JSON.parse(fs.readFileSync(process.env.LIVE_SOURCES_FILE,'utf8'));
+  if(!Array.isArray(policies))throw Error('LIVE_SOURCES_FILE must contain a JSON array of source policies');
+  for(const policy of policies)approveLiveSource(db,policy,'administrator-file');
+};
+initDemo(db);approveConfigured();
 const root=path.resolve(__dirname,'../public');
 const jsRoot=path.resolve(__dirname,'../dist/frontend');
 const json=(res,body,status=200)=>{
@@ -39,8 +50,8 @@ const server=http.createServer(async(req,res)=>{
   try{
     const hostHeader=req.headers.host||'';
     if(![`127.0.0.1:${PORT}`,`localhost:${PORT}`].includes(hostHeader))return json(res,{error:'Unrecognized local host'},400);
-    if(route==='/api/health'&&req.method==='GET')return json(res,{ok:true,demo:true,networkMonitoring:false});
-    if(route==='/api/overview'&&req.method==='GET')return json(res,getOverview(db));
+    if(route==='/api/health'&&req.method==='GET')return json(res,{ok:true,demo:true,networkMonitoring:live});
+    if(route==='/api/overview'&&req.method==='GET')return json(res,{...getOverview(db),offline:!live,liveFetch:live});
     if(route==='/api/archive'&&req.method==='GET')return json(res,searchArchive(db,url.searchParams.get('q')));
     const candidate=route.match(/^\/api\/candidates\/([a-z0-9]+)$/);
     if(candidate&&req.method==='GET'){
@@ -66,7 +77,13 @@ const server=http.createServer(async(req,res)=>{
     if(route.startsWith('/api/') && req.method==='POST'){
       assertLocal(req);
       const input=await body(req);
-      if(route==='/api/demo/reset')return json(res,{results:resetDemo(db)});
+      if(route==='/api/demo/reset'){const results=resetDemo(db);approveConfigured();return json(res,{results});}
+      // Only the source id is taken from the request; the body is ignored and no URL is accepted.
+      const livePoll=route.match(/^\/api\/sources\/([a-z0-9-]+)\/live-poll$/);
+      if(livePoll){
+        if(!live)throw Error('Live retrieval is not permitted: the server was started without LIVE_FETCH=enabled');
+        return json(res,await pollLiveSource(db,livePoll[1]));
+      }
       if(route==='/api/demo/replay-all')return json(res,{results:replayAll(db)});
       if(route==='/api/demo/poll')return json(res,replayOne(db,String(input.sourceId||''),false));
       const replay=route.match(/^\/api\/sources\/([a-z0-9-]+)\/replay$/);
@@ -98,5 +115,5 @@ const server=http.createServer(async(req,res)=>{
 });
 if(!Number.isInteger(PORT)||PORT<1024||PORT>65535)throw Error('PORT must be 1024 to 65535');
 if(HOST!=='127.0.0.1'&&HOST!=='localhost')throw Error('This demo is loopback-only.');
-server.listen(PORT,HOST,()=>console.log(`Harbor Policy Operations • DEMO ONLY • http://${HOST}:${PORT}`));
+server.listen(PORT,HOST,()=>console.log(`Harbor Policy Operations • DEMO ONLY • ${live?'LIVE FETCH ENABLED for approved sources':'offline fixtures'} • http://${HOST}:${PORT}`));
 process.on('SIGINT',()=>{server.close();db.close();process.exit(0)});
