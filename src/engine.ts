@@ -1,10 +1,15 @@
 // @ts-nocheck
-/** Persistent deterministic replay. No external source is contacted. */
+/** Persistent deterministic replay. Fixture sources never contact an external
+ * source; administrator-approved live sources are polled only on request when
+ * the server opts in (LIVE_FETCH=enabled). */
 import {DatabaseSync} from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {candidateDate,diffText,normalize,NORMALIZER_VERSION} from './diff';
+import {approvedUrl} from './network-policy';
+import {MAX_CAPTURE_BYTES} from './response-capture';
+import {captureSource,inApprovedPaths,HTML_METHOD,LIVE_TYPES} from './live-fetch';
 
 export const ORG = 'harbor-demo';
 const sha=(data:any)=>crypto.createHash('sha256').update(data).digest('hex');
@@ -22,14 +27,23 @@ export function openDb(filename=':memory:') {
   const db=new DatabaseSync(filename);
   db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
   if(filename!==':memory:')db.exec('PRAGMA journal_mode=WAL;');
-  db.exec(fs.readFileSync(path.resolve(__dirname,'../migrations/001_init.sql'),'utf8'));  return db;
+  const migration=(name)=>fs.readFileSync(path.resolve(__dirname,'../migrations',name),'utf8');
+  const version=()=>db.prepare('PRAGMA user_version').get().user_version;
+  db.exec(migration('001_init.sql'));
+  if(version()<2){
+    db.exec('BEGIN IMMEDIATE');
+    try{if(version()<2)db.exec(migration('002_live_sources.sql'));db.exec('COMMIT');}
+    catch(e){db.exec('ROLLBACK');throw e;}
+  }
+  return db;
 }
 
 function configRow(s) {return {
     name:s.name,canonicalUrl:s.canonical_url,allowedHost:s.allowed_host,
     documentTypes:JSON.parse(s.document_types),cadenceMinutes:s.cadence_minutes,
     attachmentDepth:s.attachment_depth,programLabels:JSON.parse(s.program_labels),
-    timezone:s.timezone,owner:s.owner
+    timezone:s.timezone,owner:s.owner,adapter:s.adapter,
+    pathPrefixes:JSON.parse(s.approved_path_prefixes),maxRedirects:s.max_redirects
   };}
 export function seedSources(db) {
   for(const source of FIXTURES.sources){
@@ -50,35 +64,43 @@ function saveDoc(db,source,doc,retrievedAt){
   if(doc.depth>source.attachmentDepth)throw Error('Attachment depth out of scope');
   const link=new URL(doc.path,source.canonicalUrl);
   if(link.protocol!=='https:'||link.hostname!==source.allowedHost)throw Error('Unapproved link host');
-  const linkedId=sha(source.id+':'+doc.key).slice(0,32);
+  return {...storeVersion(db,source.id,doc.key,bytes,doc.text,doc.contentType,
+    doc.contentType==='application/pdf'?'synthetic-captured-text-sidecar':'fixture-utf8',doc.extractionUncertain?1:0,retrievedAt),
+    sourcePath:link.pathname,depth:doc.depth};
+}
+/** Original bytes, SHA-256, extracted text and normalizer run, shared by both adapters. */
+function storeVersion(db,sourceId,key,bytes,text,contentType,method,uncertain,recordedAt){
+  const linkedId=sha(sourceId+':'+key).slice(0,32);
   db.prepare('INSERT OR IGNORE INTO linked_documents(id,source_id,document_key,first_seen_at) VALUES (?,?,?,?)')
-    .run(linkedId,source.id,doc.key,retrievedAt);
+    .run(linkedId,sourceId,key,recordedAt);
   const hash=sha(bytes),versionId=sha(linkedId+hash).slice(0,32);
   db.prepare(`INSERT OR IGNORE INTO document_versions(id,linked_document_id,original_bytes,sha256,
     extracted_text,content_type,extraction_method,extraction_uncertain,recorded_at) VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(versionId,linkedId,bytes,hash,doc.text,doc.contentType,
-      doc.contentType==='application/pdf'?'synthetic-captured-text-sidecar':'fixture-utf8',doc.extractionUncertain?1:0,retrievedAt);
-  const normalized=normalize(doc.text);
+    .run(versionId,linkedId,bytes,hash,text,contentType,method,uncertain,recordedAt);
+  const normalized=normalize(text);
   db.prepare(`INSERT OR IGNORE INTO normalization_runs(id,document_version_id,normalizer_version,normalized_text,normalized_hash)
     VALUES (?,?,?,?,?)`).run(sha(versionId+NORMALIZER_VERSION).slice(0,32),versionId,NORMALIZER_VERSION,normalized,sha(normalized));
-  return {linkedId,versionId,hash,sourcePath:link.pathname,depth:doc.depth};
+  return {linkedId,versionId,hash};
 }
 function docsForSnapshot(db,snapshotId){
   return db.prepare(`SELECT d.id,d.linked_document_id,d.sha256,d.extracted_text,d.extraction_uncertain,
-    x.source_path,x.depth FROM snapshot_documents x JOIN document_versions d ON x.document_version_id=d.id
+    d.extraction_method,x.source_path,x.depth FROM snapshot_documents x JOIN document_versions d ON x.document_version_id=d.id
     WHERE x.snapshot_id=?`).all(snapshotId);
 }
-function writeCandidate(db,source,snap,linkedId,previous,current,kind){
+function writeCandidate(db,source,snap,linkedId,previous,current,kind,actor){
   const beforeSha=previous?.sha256||'ABSENT',afterSha=current?.sha256||'ABSENT';
   if(beforeSha===afterSha)return;
   const before=previous?.extracted_text||'',after=current?.extracted_text||'';
   let hunks=diffText(before,after);
-  if(!hunks.length && previous?.source_path!==current?.source_path)return;
+  // Live PDFs have no extracted text, so equal (empty) text says nothing about changed bytes.
+  const unextracted=[previous,current].some(d=>String(d?.extraction_method||'').startsWith('unavailable'));
+  if(!hunks.length && previous?.source_path!==current?.source_path && !unextracted)return;
   const editorial=hunks.length>0&&hunks.every(x=>x.kind==='editorial');
   const changeKind=kind|| (editorial?'editorial':'modified');
   const pathValue=current?.source_path||previous?.source_path||'(unknown attachment)';
   const summary=changeKind==='disappeared'?'Attachment absent from newer snapshot — not evidence of withdrawal':
     changeKind==='appeared'?'Attachment discovered or restored':
+    unextracted&&!hunks.length?'Original PDF bytes changed; no text was extracted — compare the originals':
     editorial?'Boilerplate or navigation changed; substantive text stable':
     'Text changed — reviewer must assess operational significance';
   if(!hunks.length)hunks=[{kind:'editorial',before,after,section:'Original source bytes'}];
@@ -94,13 +116,28 @@ function writeCandidate(db,source,snap,linkedId,previous,current,kind){
   if(inserted.changes){
     for(const [n,hunk] of hunks.entries())db.prepare(`INSERT INTO diff_hunks(id,candidate_id,ordinal,kind,section,before_text,after_text)
       VALUES (?,?,?,?,?,?,?)`).run(sha(id+':'+n).slice(0,32),id,n,hunk.kind,hunk.section,hunk.before,hunk.after);
-    audit(db,'candidate',id,'detected','fixture-replay',{changeKind,sourcePath:pathValue,uncertainOCR:!!(current?.extraction_uncertain||previous?.extraction_uncertain)});
+    audit(db,'candidate',id,'detected',actor,{changeKind,sourcePath:pathValue,uncertainOCR:!!(current?.extraction_uncertain||previous?.extraction_uncertain)});
+  }
+}
+/** Compare a snapshot with its predecessor through the shared candidate pipeline. */
+function detectChanges(db,source,prevId,snap,skippedLinkedIds,actor){
+  const previous=docsForSnapshot(db,prevId),current=docsForSnapshot(db,snap.id);
+  const oldMap=new Map(previous.map(d=>[d.linked_document_id,d]));
+  const newMap=new Map(current.map(d=>[d.linked_document_id,d]));
+  for(const key of new Set([...oldMap.keys(),...newMap.keys()])) {
+    const before=oldMap.get(key),after=newMap.get(key);
+    if(before && !after && skippedLinkedIds.has(key))continue; // Outside scope is not disappearance.
+    if(before && !after)writeCandidate(db,source,snap,key,before,null,'disappeared',actor);
+    else if(!before && after)writeCandidate(db,source,snap,key,null,after,'appeared',actor);
+    else if(before?.sha256!==after?.sha256)writeCandidate(db,source,snap,key,before,after,null,actor);
+    else if(before?.source_path!==after?.source_path) audit(db,'linked_document',key,'source_path_changed',actor,{from:before.source_path,to:after.source_path,contentUnchanged:true});
   }
 }
 export function replayOne(db,sourceId,increment=true) {
   const source=db.prepare('SELECT * FROM sources WHERE id=? AND org_id=?').get(sourceId,ORG);
   if(!source)throw Error('Unknown demo source');
   const fixture=FIXTURES.sources.find(s=>s.id===sourceId);
+  if(!fixture)throw Error('Fixture replay is unsupported for a live source');
   const cursor=Math.min(source.replay_cursor,fixture.versions.length-1);
   const entry=fixture.versions[cursor];
   const fixtureVersion=cursor+1;
@@ -139,19 +176,8 @@ export function replayOne(db,sourceId,increment=true) {
     const scopeError=skippedPaths.length?`Policy scope excluded ${skippedPaths.length} link(s); coverage incomplete.`:null;
     attempts.run(uid(),sourceId,fixtureVersion,entry.retrievedAt,scopeError?'failure':'success',scopeError,
       JSON.stringify({adapter:'fixture',network:false,maxDepth:source.attachment_depth,maxBytes:2000000,allowedHost:source.allowed_host,skippedPaths}));
-    if(!existed && prev){
-      const previous=docsForSnapshot(db,prev.id),current=docsForSnapshot(db,snapId);
-      const oldMap=new Map(previous.map(d=>[d.linked_document_id,d]));
-      const newMap=new Map(current.map(d=>[d.linked_document_id,d]));
-      for(const key of new Set([...oldMap.keys(),...newMap.keys()])) {
-        const before=oldMap.get(key),after=newMap.get(key);
-        if(before && !after && skippedLinkedIds.has(key))continue; // Outside scope is not disappearance.
-        if(before && !after)writeCandidate(db,source,{id:snapId,retrieved_at:entry.retrievedAt,published_date:entry.publishedDate},key,before,null,'disappeared');
-        else if(!before && after)writeCandidate(db,source,{id:snapId,retrieved_at:entry.retrievedAt,published_date:entry.publishedDate},key,null,after,'appeared');
-        else if(before?.sha256!==after?.sha256)writeCandidate(db,source,{id:snapId,retrieved_at:entry.retrievedAt,published_date:entry.publishedDate},key,before,after,null);
-        else if(before?.source_path!==after?.source_path) audit(db,'linked_document',key,'source_path_changed','fixture-replay',{from:before.source_path,to:after.source_path,contentUnchanged:true});
-      }
-    }
+    if(!existed && prev)detectChanges(db,source,prev.id,
+      {id:snapId,retrieved_at:entry.retrievedAt,published_date:entry.publishedDate},skippedLinkedIds,'fixture-replay');
     const nextCursor=increment?Math.min(fixture.versions.length,source.replay_cursor+1):source.replay_cursor;
     if(scopeError){
       db.prepare(`UPDATE sources SET replay_cursor=?,last_attempt_at=?,latest_status='failure',latest_error=? WHERE id=?`)
@@ -184,10 +210,133 @@ export function resetDemo(db){
 }
 export function initDemo(db){seedSources(db);return replayAll(db);}
 
+const TIMEZONES=['America/New_York','UTC','America/Chicago','America/Los_Angeles'];
+/**
+ * Administrator approval of a live source: the only way a live allowlist is
+ * written. Called from server start-up (LIVE_SOURCES_FILE) or code, never from
+ * an HTTP route. A stored source can never change host or adapter, so approval
+ * cannot widen an existing allowlist.
+ */
+export function approveLiveSource(db,p,actor='administrator'){
+  if(!p||typeof p!=='object')throw Error('Invalid live source policy');
+  if(typeof p.id!=='string'||!/^[a-z0-9][a-z0-9-]{0,39}$/.test(p.id))throw Error('Invalid live source id');
+  if(typeof p.name!=='string'||!p.name.trim()||p.name.length>120)throw Error('Invalid live source name');
+  const host=String(p.allowedHost||'').toLowerCase(),canonical=approvedUrl(p.canonicalUrl,{approvedHost:host});
+  const prefixes=p.pathPrefixes,types=p.documentTypes,labels=p.programLabels;
+  if(!Array.isArray(prefixes)||!prefixes.length||prefixes.length>20||prefixes.some(x=>typeof x!=='string'||
+    !x.startsWith('/')||x.length>200||new URL(x,canonical).pathname!==x))throw Error('Invalid approved path prefixes');
+  if(!inApprovedPaths(canonical,prefixes))throw Error('Canonical URL is outside the approved path prefixes');
+  if(!Array.isArray(types)||!types.length||types.some(t=>!LIVE_TYPES.includes(t)))throw Error('Live document types must be text/html and/or application/pdf');
+  const depth=p.attachmentDepth,redirects=p.maxRedirects??2,cadence=p.cadenceMinutes??1440,timezone=p.timezone??'UTC';
+  if(!Number.isInteger(depth)||depth<0||depth>3)throw Error('Attachment depth out of bounds');
+  if(!Number.isInteger(redirects)||redirects<0||redirects>5)throw Error('Redirect limit out of bounds');
+  if(!Number.isInteger(cadence)||cadence<15||cadence>10080)throw Error('Cadence out of bounds');
+  if(!TIMEZONES.includes(timezone))throw Error('Unsupported timezone');
+  if(typeof p.owner!=='string'||!p.owner.trim()||p.owner.length>100)throw Error('Invalid owner');
+  if(!Array.isArray(labels)||labels.length<1||labels.length>10||labels.some(l=>typeof l!=='string'||l.length>60||!l.trim()))throw Error('Invalid program labels');
+  const old=db.prepare('SELECT * FROM sources WHERE id=?').get(p.id);
+  if(old&&(old.adapter!=='live'||old.allowed_host!==host))throw Error('An approved source cannot change host or adapter');
+  const values=[p.name.trim(),canonical.href,host,JSON.stringify(types),cadence,depth,JSON.stringify(labels),timezone,
+    p.owner.trim(),JSON.stringify(prefixes),redirects,p.id];
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    if(old)db.prepare(`UPDATE sources SET name=?,canonical_url=?,allowed_host=?,document_types=?,cadence_minutes=?,attachment_depth=?,
+      program_labels=?,timezone=?,owner=?,approved_path_prefixes=?,max_redirects=? WHERE id=?`).run(...values);
+    else db.prepare(`INSERT INTO sources(name,canonical_url,allowed_host,document_types,cadence_minutes,attachment_depth,program_labels,
+      timezone,owner,approved_path_prefixes,max_redirects,id,org_id,adapter) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'live')`).run(...values,ORG);
+    const config=JSON.stringify(configRow(db.prepare('SELECT * FROM sources WHERE id=?').get(p.id)));
+    const last=db.prepare('SELECT config FROM source_policy_versions WHERE source_id=? ORDER BY rowid DESC LIMIT 1').get(p.id);
+    if(last?.config!==config){
+      db.prepare('INSERT INTO source_policy_versions(id,source_id,config,created_at,created_by) VALUES (?,?,?,?,?)').run(uid(),p.id,config,now(),actor);
+      audit(db,'source',p.id,old?'configuration_changed':'live_source_approved',actor,{allowedHost:host,pathPrefixes:prefixes});
+    }
+    db.exec('COMMIT');
+  }catch(e){db.exec('ROLLBACK');throw e;}
+  return configRow(db.prepare('SELECT * FROM sources WHERE id=?').get(p.id));
+}
+const livePolls=new Set();
+/**
+ * Poll one approved live source now. Its allowlist is the stored policy only;
+ * the request carries no URL. `deps` (resolver, connector, tighter limits) is
+ * for tests and reachable only from code: the server passes none, so
+ * production uses system DNS, the pinned HTTPS connector and full limits.
+ */
+export async function pollLiveSource(db,sourceId,deps){
+  const source=db.prepare('SELECT * FROM sources WHERE id=? AND org_id=?').get(sourceId,ORG);
+  if(!source)throw Error('Unknown demo source');
+  if(source.adapter!=='live')throw Error('Live retrieval is unsupported for a fixture source');
+  if(livePolls.has(sourceId))throw Error('A live poll for this source is already running');
+  livePolls.add(sourceId);
+  try{
+    const capture=await captureSource({canonicalUrl:source.canonical_url,
+      boundary:{approvedHost:source.allowed_host,maxRedirects:source.max_redirects},
+      pathPrefixes:JSON.parse(source.approved_path_prefixes),attachmentDepth:source.attachment_depth,
+      documentTypes:JSON.parse(source.document_types).filter(t=>LIVE_TYPES.includes(t))},deps);
+    return recordLiveCapture(db,source,capture);
+  }finally{livePolls.delete(sourceId);}
+}
+/** Write one live capture atomically: versions, snapshot, candidates, coverage. */
+function recordLiveCapture(db,source,cap){
+  const at=cap.startedAt,linkId=(key)=>sha(source.id+':'+key).slice(0,32);
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    const latest=db.prepare('SELECT id,fixture_version FROM snapshots WHERE source_id=? ORDER BY fixture_version DESC LIMIT 1').get(source.id);
+    const previous=latest?docsForSnapshot(db,latest.id):[];
+    const prior=new Map(previous.map(d=>[d.linked_document_id,d]));
+    const canonical=cap.documents.find(d=>d.depth===0),current=[];
+    for(const d of canonical?cap.documents:[]){
+      const linkedId=linkId(d.key),old=prior.get(linkedId);
+      // HTML change is judged on extracted text: markup-only byte changes (nonces) keep the prior version.
+      const versionId=old&&d.method===HTML_METHOD&&old.extraction_method===HTML_METHOD&&old.extracted_text===d.text?old.id:
+        storeVersion(db,source.id,d.key,d.bytes,d.text,d.contentType,d.method,d.uncertain,at).versionId;
+      current.push({linkedId,versionId,sourcePath:d.sourcePath,depth:d.depth});
+    }
+    const captured=new Set(current.map(c=>c.linkedId));
+    const unseen=new Set(cap.entries.filter(e=>e.key&&e.outcome!=='captured').map(e=>linkId(e.key)));
+    const problems=cap.entries.filter(e=>e.outcome==='failed'||e.reason==='too_large'||e.reason==='budget');
+    const missed=previous.filter(p=>!captured.has(p.linked_document_id)&&unseen.has(p.linked_document_id));
+    const incomplete=!canonical||problems.length>0||missed.length>0;
+    // Absence is asserted only on complete coverage. Otherwise earlier versions carry forward, never "removed".
+    const carried=incomplete?previous.filter(p=>!captured.has(p.linked_document_id)):[];
+    for(const p of carried)current.push({linkedId:p.linked_document_id,versionId:p.id,sourcePath:p.source_path,depth:p.depth});
+    const unchanged=!!canonical&&!!latest&&current.length===previous.length&&
+      current.every(c=>previous.some(p=>p.id===c.versionId&&p.source_path===c.sourcePath));
+    let seq=latest?.fixture_version||0;
+    if(canonical&&!unchanged){
+      const snap={id:sha(source.id+':live:'+(++seq)).slice(0,32),retrieved_at:at,published_date:null};
+      db.prepare(`INSERT INTO snapshots(id,source_id,fixture_version,homepage_original,homepage_sha,retrieved_at,published_date)
+        VALUES (?,?,?,?,?,?,?)`).run(snap.id,source.id,seq,canonical.bytes,canonical.sha256,at,null);
+      for(const c of current)db.prepare('INSERT INTO snapshot_documents(snapshot_id,document_version_id,source_path,depth) VALUES (?,?,?,?)')
+        .run(snap.id,c.versionId,c.sourcePath,c.depth);
+      if(latest)detectChanges(db,source,latest.id,snap,new Set(),'live-adapter');
+    }
+    const reasons=[...new Set(problems.map(e=>e.reason))],parts=[];
+    if(problems.length)parts.push(`${problems.length} URL(s) failed or exceeded limits (${reasons.join(', ')})`);
+    if(missed.length)parts.push(`${missed.length} previously captured document(s) not recaptured`);
+    const error=!canonical?`Canonical page not captured (${cap.entries[0]?.reason}); coverage incomplete.`:
+      incomplete?`Coverage incomplete: ${parts.join('; ')}.`:null;
+    let kept=0;
+    const urls=cap.entries.filter(e=>e.outcome!=='skipped'||kept++<cap.limits.maxSkipEntries);
+    db.prepare('INSERT INTO fetch_attempts(id,source_id,fixture_version,attempted_at,status,reason,scope_decisions) VALUES (?,?,?,?,?,?,?)')
+      .run(uid(),source.id,seq,at,incomplete?'failure':'success',error||(unchanged?'No change since the previous live capture.':null),
+        JSON.stringify({adapter:'live',network:true,allowedHost:source.allowed_host,pathPrefixes:JSON.parse(source.approved_path_prefixes),
+          maxDepth:source.attachment_depth,maxBytes:MAX_CAPTURE_BYTES,maxRedirects:source.max_redirects,
+          budget:{documents:cap.limits.maxDocuments,bytes:cap.limits.maxPollBytes,pollMs:cap.limits.pollTimeoutMs},
+          unchanged,carriedForward:carried.map(p=>p.source_path),urls,omittedEntries:cap.entries.length-urls.length}));
+    if(incomplete){
+      db.prepare(`UPDATE sources SET last_attempt_at=?,latest_status='failure',latest_error=? WHERE id=?`).run(at,error,source.id);
+      audit(db,'source',source.id,'coverage_failed','live-adapter',{reasons,notRecaptured:missed.length});
+    }else db.prepare(`UPDATE sources SET last_attempt_at=?,last_success_at=?,latest_status='success',latest_error=NULL WHERE id=?`)
+      .run(at,at,source.id);
+    db.exec('COMMIT');
+    return {sourceId:source.id,status:incomplete?'failure':unchanged?'unchanged':'success',version:seq,error,urls:cap.entries.length};
+  }catch(e){db.exec('ROLLBACK');throw e;}
+}
+
 export function getOverview(db){
   const sources=db.prepare('SELECT * FROM sources WHERE org_id=? ORDER BY name').all(ORG).map(s=>({...configRow(s),id:s.id,replayCursor:s.replay_cursor,
     lastAttemptAt:s.last_attempt_at,lastSuccessAt:s.last_success_at,status:s.latest_status,error:s.latest_error,
-    versionsCount:FIXTURES.sources.find(f=>f.id===s.id).versions.length}));
+    versionsCount:FIXTURES.sources.find(f=>f.id===s.id)?.versions.length??0}));
   const candidates=db.prepare(`SELECT c.*,s.name AS source_name,s.program_labels,s.owner AS source_owner,
     (SELECT r.classification FROM review_dispositions r WHERE r.candidate_id=c.id ORDER BY r.reviewed_at DESC,r.rowid DESC LIMIT 1) AS classification,
     (SELECT r.confirmed_effective_date FROM review_dispositions r WHERE r.candidate_id=c.id ORDER BY r.reviewed_at DESC,r.rowid DESC LIMIT 1) AS confirmed_effective_date,
@@ -275,7 +424,7 @@ export function updateSource(db,id,data){
   const depth=data.attachmentDepth===undefined?old.attachment_depth:data.attachmentDepth;
   const labels=data.programLabels===undefined?JSON.parse(old.program_labels):data.programLabels;
   if(typeof owner!=='string'||!owner.trim()||owner.length>100)throw Error('Invalid owner');
-  if(typeof timezone!=='string'||!['America/New_York','UTC','America/Chicago','America/Los_Angeles'].includes(timezone))throw Error('Unsupported timezone');
+  if(typeof timezone!=='string'||!TIMEZONES.includes(timezone))throw Error('Unsupported timezone');
   if(!Number.isInteger(cadence)||cadence<15||cadence>10080)throw Error('Cadence out of bounds');
   if(!Number.isInteger(depth)||depth<0||depth>3)throw Error('Attachment depth out of bounds');
   if(!Array.isArray(labels)||labels.length<1||labels.length>10||labels.some(l=>typeof l!=='string'||l.length>60||!l.trim()))throw Error('Invalid program labels');
@@ -313,7 +462,7 @@ export function searchArchive(db,q){
 
 /** Offline evidence receipt. Hashes attest local consistency, not third-party provenance or approval. */
 export function evidencePacket(db,id){
-  const c=db.prepare(`SELECT c.*,s.name AS source_name,s.canonical_url,s.allowed_host,s.program_labels
+  const c=db.prepare(`SELECT c.*,s.name AS source_name,s.canonical_url,s.allowed_host,s.program_labels,s.adapter
     FROM change_candidates c JOIN sources s ON s.id=c.source_id
     WHERE c.id=? AND c.org_id=? AND s.org_id=?`).get(id,ORG,ORG);
   if(!c)return null;
@@ -363,5 +512,7 @@ export function evidencePacket(db,id){
     documents:{before:before&&{...before,extractedText:undefined},after:after&&{...after,extractedText:undefined}},
     integrity:{state:failures.length?'failed':'verified',checks:['original-byte-sha256','candidate-sha256','normalizer-run','stored-diff'],failures,
       caveat:'Local consistency only; this is not a digital signature, proof of official publication, or legal approval.'},
-    reviewHistory:reviews,action,auditTrail:events.map(e=>({...e,metadata:JSON.parse(e.metadata)})),exportScope:'Synthetic offline demo; no live data fetched.'};
+    reviewHistory:reviews,action,auditTrail:events.map(e=>({...e,metadata:JSON.parse(e.metadata)})),
+    exportScope:c.adapter==='live'?'Demo workspace; captured from an administrator-approved live source. Not a legal interpretation.':
+      'Synthetic offline demo; no live data fetched.'};
 }
