@@ -27,31 +27,60 @@ function v4ToInt(ip:string):number|null {
  if(parts.length!==4||parts.some(x=>!/^\d{1,3}$/.test(x)||Number(x)>255))return null;
  return parts.reduce((n,x)=>((n<<8)|Number(x))>>>0,0);
 }
+function privateV4Int(value:number):boolean {
+ return V4_DENY.some(([base,prefix])=>inV4Range(value,v4ToInt(base)!,prefix));
+}
 function privateV4(ip:string):boolean {
  const value=v4ToInt(ip);
- if(value===null)return true;
- return V4_DENY.some(([base,prefix])=>inV4Range(value,v4ToInt(base)!,prefix));
+ return value===null||privateV4Int(value);
+}
+// IPv6 is compared numerically, never as text, so every spelling of an
+// address (leading zeros, case, embedded dotted IPv4) is judged the same.
+// Only global unicast 2000::/3 is considered; inside it these are denied,
+// following the IANA IPv6 Special-Purpose Address Registry. As with IPv4,
+// the whole IETF protocol-assignment block is denied, including its few
+// globally reachable exceptions, and 6to4 is denied outright (RFC 7526).
+const V6_DENY: ReadonlyArray<readonly [string,number]> = [
+ ['2001::',23],     // IETF protocol assignments: Teredo, benchmarking, AMT, ORCHID, ORCHIDv2, drone remote ID
+ ['2001:db8::',32], // documentation
+ ['2002::',16],     // 6to4, which can carry any IPv4 address
+ ['3fff::',20]      // documentation (RFC 9637)
+];
+function v6ToBig(address:string):bigint|null {
+ let text=address.toLowerCase();
+ if(text.includes('.')){
+  const cut=text.lastIndexOf(':');
+  const v4=v4ToInt(text.slice(cut+1));
+  if(v4===null)return null;
+  text=text.slice(0,cut+1)+(v4>>>16).toString(16)+':'+(v4&0xffff).toString(16);
+ }
+ const halves=text.split('::');
+ if(halves.length>2)return null;
+ const groups=(part:string)=>part===''?[]:part.split(':');
+ const head=groups(halves[0]),tail=halves.length===2?groups(halves[1]):[];
+ const missing=8-head.length-tail.length;
+ if(halves.length===1?missing!==0:missing<1)return null;
+ const all=[...head,...Array(halves.length===2?missing:0).fill('0'),...tail];
+ if(all.some(g=>!/^[0-9a-f]{1,4}$/.test(g)))return null;
+ return all.reduce((n,g)=>(n<<16n)|BigInt(Number.parseInt(g,16)),0n);
+}
+function inV6Range(value:bigint, base:string, prefix:number):boolean {
+ const shift=BigInt(128-prefix);
+ return (value>>shift)===(v6ToBig(base)!>>shift);
 }
 /** Fail closed on non-global unicast addresses, including mapped IPv4. */
 export function publicAddress(address:string):boolean {
  const family=net.isIP(address);
  if(family===4)return !privateV4(address);
  if(family!==6)return false;
- const value=address.toLowerCase().split('%')[0];
- if(value.includes('%'))return false;
- if(value==='::'||value==='::1')return false;
- if(value.startsWith('::ffff:')){
-  const embedded=value.slice(7);
-  return net.isIP(embedded)===4 ? !privateV4(embedded) : false;
- }
- // Only global 2000::/3 addresses are considered, and certain allocations
- // remain excluded. A production implementation should use maintained
- // IANA special-purpose registries rather than rely on this first-pass filter.
- const head=Number.parseInt(value.split(':')[0],16);
- if(!Number.isFinite(head)||head<0x2000||head>0x3fff)return false;
- if(value.startsWith('2001:db8:'))return false; // documentation
- if(value.startsWith('2001:10:')||value.startsWith('2001:20:'))return false;
- return true;
+ // A zone ID ("%eth0") only scopes link-local and similar addresses.
+ if(address.includes('%'))return false;
+ const value=v6ToBig(address);
+ if(value===null)return false;
+ // IPv4-mapped ::ffff:0:0/96 in any spelling is judged as its IPv4 address.
+ if((value>>32n)===0xffffn)return !privateV4Int(Number(value&0xffffffffn));
+ if(!inV6Range(value,'2000::',3))return false;
+ return !V6_DENY.some(([base,prefix])=>inV6Range(value,base,prefix));
 }
 export function approvedUrl(raw:string, boundary:SourceBoundary):URL {
  if(typeof raw!=='string'||raw.length>2048||/[\x00-\x20\x7f]/.test(raw))

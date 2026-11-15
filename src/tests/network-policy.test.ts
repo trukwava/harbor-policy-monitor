@@ -73,3 +73,36 @@ test('mapped IPv4 and malformed addresses cannot bypass private checks',()=>{
  assert.equal(publicAddress('::ffff:8.8.8.8'),true);
  assert.deepEqual(validateResolution(['1.1.1.1','::ffff:8.8.8.8']),['1.1.1.1','::ffff:8.8.8.8']);
 });
+
+test('6to4 and Teredo cannot smuggle a blocked IPv4 address',()=>{
+ for(const ip of ['2002:7f00:1::','2002:a9fe:a9fe::1','2002:808:808::',
+  '2001:0:4136:e378:8000:63bf:3fff:fdd2','2001::1']){
+  assert.equal(publicAddress(ip),false,ip);
+ }
+ assert.throws(()=>validateResolution(['8.8.8.8','2002:7f00:1::']));
+});
+
+test('IPv6 special-purpose ranges are denied in every spelling',()=>{
+ for(const ip of ['2001:db8::1','2001:0db8::1','2001:DB8::1','2001:db8:0:0:0:0:0:1',
+  '2001:db8:ffff:ffff:ffff:ffff:ffff:ffff','3fff::1','3fff:fff:ffff::1',
+  '2001:2::1','2001:3::1','2001:10::1','2001:1f:ffff::1','2001:20::1','2001:2f:ffff::1',
+  '2001:30::1','2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff','::ffff:a00:1','::ffff:7f00:1',
+  '::1.2.3.4','64:ff9b::808:808','5f00::1','100::1','fec0::1','ff02::1']){
+  assert.equal(publicAddress(ip),false,ip);
+  assert.throws(()=>validateResolution(['2606:4700:4700::1111',ip]),undefined,ip);
+ }
+});
+
+test('scoped IPv6 addresses with a zone ID are rejected',()=>{
+ for(const ip of ['fe80::1%eth0','fe80::1%1','2606:4700:4700::1111%eth0']){
+  assert.equal(publicAddress(ip),false,ip);
+ }
+});
+
+test('public IPv6 addresses next to denied ranges remain usable',()=>{
+ const addresses=['2606:4700:4700::1111','2001:4860:4860::8888','2001:200::1',
+  '2001:db7:ffff::1','2001:db9::1','2003::1','2001:1c00::1','3fff:1000::1',
+  '::ffff:808:808','2001:4860:4860:0:0:0:0:8888'];
+ for(const ip of addresses)assert.equal(publicAddress(ip),true,ip);
+ assert.deepEqual(validateResolution(addresses),addresses);
+});
